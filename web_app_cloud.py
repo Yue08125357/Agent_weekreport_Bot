@@ -1,12 +1,14 @@
 """
-周报助手 - 云端版
-用户复制表格内容，网页自动生成周报
+周报助手 - 云端全自动版
+用户只需扫码登录，其他全自动
 """
 
+import asyncio
 import io
 import sys
 import csv
 import re
+import base64
 from pathlib import Path
 from datetime import datetime, timedelta
 from io import StringIO
@@ -27,6 +29,9 @@ TEMPLATE = Path("template.docx")
 DEFAULT_WPS_URL = "https://www.kdocs.cn/l/cmvjNWclJM5P"
 
 app = FastAPI(title="周报助手")
+
+# 任务存储
+tasks = {}
 
 
 def parse_table(text):
@@ -128,6 +133,238 @@ def generate_report(table_content: str, date: str) -> bytes:
     return buffer.getvalue()
 
 
+async def run_browser_task(task_id: str, wps_url: str, input_date: str):
+    """后台运行浏览器任务"""
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+    
+    browser = None
+    playwright = None
+    
+    try:
+        tasks[task_id]["status"] = "launching"
+        tasks[task_id]["message"] = "正在启动浏览器..."
+        
+        playwright = await async_playwright().start()
+        
+        # 启动浏览器（无头模式，但添加隐藏自动化特征的参数）
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-infobars',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+            ]
+        )
+        
+        context = await browser.new_context(
+            viewport={'width': 1280, 'height': 800},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        page = await context.new_page()
+        
+        # 注入脚本隐藏自动化特征
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = {runtime: {}};
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh']});
+        """)
+        
+        # 打开WPS
+        tasks[task_id]["status"] = "loading"
+        tasks[task_id]["message"] = "正在打开WPS表格..."
+        
+        try:
+            await page.goto(wps_url, wait_until="domcontentloaded", timeout=30000)
+        except:
+            pass
+        
+        await asyncio.sleep(3)
+        
+        # 检测是否需要登录
+        tasks[task_id]["status"] = "waiting_login"
+        tasks[task_id]["message"] = "请在下方扫码登录微信"
+        
+        # 等待登录，每2秒截图一次
+        max_wait = 90  # 最多等待90秒
+        logged_in = False
+        
+        for i in range(max_wait // 2):
+            try:
+                # 截图
+                screenshot = await page.screenshot(type="jpeg", quality=60)
+                screenshot_b64 = base64.b64encode(screenshot).decode('utf-8')
+                tasks[task_id]["screenshot"] = screenshot_b64
+                tasks[task_id]["wait_time"] = i * 2
+                
+                # 检查URL
+                current_url = page.url
+                if 'passport' not in current_url and 'singlesign' not in current_url and 'login' not in current_url:
+                    # 检查是否有表格元素
+                    try:
+                        canvas = await page.query_selector('[class*="canvas"], [class*="sheet"], [class*="editor"], canvas')
+                        if canvas:
+                            logged_in = True
+                            break
+                    except:
+                        pass
+                
+                await asyncio.sleep(2)
+            except Exception as e:
+                await asyncio.sleep(2)
+        
+        if not logged_in:
+            # 最后再检查一次
+            current_url = page.url
+            if 'passport' not in current_url and 'singlesign' not in current_url:
+                logged_in = True
+        
+        if not logged_in:
+            raise Exception("登录超时，请刷新页面重试")
+        
+        # 登录成功
+        tasks[task_id]["status"] = "reading"
+        tasks[task_id]["message"] = "登录成功，正在读取表格..."
+        tasks[task_id]["screenshot"] = None
+        
+        # 等待表格加载
+        await asyncio.sleep(5)
+        
+        # 点击最新Sheet
+        sheet_name = ""
+        try:
+            # 尝试多种选择器
+            selectors = [
+                '[class*="sheet-tab"]:not([style*="display: none"])',
+                '.sheet-tab:last-child',
+                '[role="tab"]:last-child',
+            ]
+            for selector in selectors:
+                try:
+                    tabs = await page.query_selector_all(selector)
+                    if tabs:
+                        last_tab = tabs[-1]
+                        sheet_name = await last_tab.inner_text()
+                        sheet_name = sheet_name.strip()
+                        await last_tab.click()
+                        await asyncio.sleep(2)
+                        break
+                except:
+                    continue
+        except Exception as e:
+            pass
+        
+        # 获取表格数据
+        tasks[task_id]["message"] = "正在提取表格数据..."
+        
+        # 方法1：使用JavaScript提取表格
+        table_text = await page.evaluate('''() => {
+            // 尝试从剪贴板API获取
+            // 或者遍历DOM获取表格内容
+            
+            let result = [];
+            
+            // 查找所有单元格
+            const cells = document.querySelectorAll('td, th, [class*="cell"]');
+            if (cells.length > 0) {
+                let rows = {};
+                cells.forEach(cell => {
+                    const rect = cell.getBoundingClientRect();
+                    const y = Math.round(rect.top / 25); // 按行分组
+                    if (!rows[y]) rows[y] = [];
+                    rows[y].push(cell.innerText?.trim() || '');
+                });
+                
+                const sortedYs = Object.keys(rows).sort((a, b) => a - b);
+                sortedYs.forEach(y => {
+                    result.push(rows[y].join('\\t'));
+                });
+                
+                return result.join('\\n');
+            }
+            
+            // 备选：获取整个编辑区内容
+            const editor = document.querySelector('[class*="editor"], [class*="canvas"], [contenteditable="true"]');
+            if (editor) {
+                return editor.innerText;
+            }
+            
+            return '';
+        }''')
+        
+        # 方法2：如果方法1失败，尝试全选复制
+        if not table_text or len(table_text) < 20:
+            try:
+                # 点击编辑区域
+                await page.click('[class*="canvas"], [class*="editor"], body', timeout=3000)
+            except:
+                pass
+            await asyncio.sleep(0.5)
+            
+            # 全选
+            await page.keyboard.press('Control+A')
+            await asyncio.sleep(0.5)
+            
+            # 复制
+            await page.keyboard.press('Control+C')
+            await asyncio.sleep(1)
+            
+            # 使用JavaScript读取选中内容
+            table_text = await page.evaluate('''() => {
+                const selection = window.getSelection();
+                if (selection.rangeCount > 0) {
+                    const range = selection.getRangeAt(0);
+                    const div = document.createElement('div');
+                    div.appendChild(range.cloneContents());
+                    return div.innerText || '';
+                }
+                return '';
+            }''')
+        
+        # 关闭浏览器
+        await browser.close()
+        await playwright.stop()
+        browser = None
+        playwright = None
+        
+        # 确定日期
+        date = input_date
+        if not date:
+            match = re.search(r'(\d{4}[-—–]\d{4})', sheet_name)
+            if match:
+                date = match.group(1).replace('—', '-').replace('–', '-')
+            else:
+                date = datetime.now().strftime("%m%d") + "-" + (datetime.now() + timedelta(days=4)).strftime("%m%d")
+        
+        tasks[task_id]["date"] = date
+        tasks[task_id]["message"] = "正在生成周报..."
+        
+        # 生成报告
+        if not table_text or len(table_text) < 10:
+            raise ValueError("未能读取表格内容，请确保已登录并选择了正确的Sheet")
+        
+        doc_bytes = generate_report(table_text, date)
+        tasks[task_id]["document"] = base64.b64encode(doc_bytes).decode('utf-8')
+        tasks[task_id]["status"] = "done"
+        tasks[task_id]["message"] = "周报已生成！"
+        
+    except Exception as e:
+        tasks[task_id]["status"] = "error"
+        tasks[task_id]["message"] = f"错误: {str(e)}"
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except:
+                pass
+        if playwright:
+            try:
+                await playwright.stop()
+            except:
+                pass
+
+
 # HTML页面
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -158,68 +395,14 @@ HTML_PAGE = """
         h1 { color: #333; margin-bottom: 10px; font-size: 28px; text-align: center; }
         .subtitle { color: #666; margin-bottom: 30px; font-size: 14px; text-align: center; }
         
-        .step {
-            background: #f8f9fa;
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 20px;
-            border-left: 4px solid #667eea;
-        }
-        .step-title {
-            font-weight: 600;
-            color: #333;
-            margin-bottom: 10px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .step-num {
-            background: #667eea;
-            color: white;
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 12px;
-        }
-        
-        .link-box {
-            background: #e3f2fd;
-            padding: 12px 16px;
-            border-radius: 8px;
-            margin: 10px 0;
-            word-break: break-all;
-        }
-        .link-box a {
-            color: #1565c0;
-            text-decoration: none;
-        }
-        .link-box a:hover {
-            text-decoration: underline;
-        }
-        
-        label { display: block; font-weight: 600; color: #333; margin-bottom: 8px; margin-top: 15px; }
-        
-        textarea {
-            width: 100%;
-            padding: 12px 16px;
-            border: 2px solid #e0e0e0;
-            border-radius: 8px;
-            font-size: 14px;
-            resize: vertical;
-            min-height: 120px;
-            font-family: inherit;
-        }
-        textarea:focus { outline: none; border-color: #667eea; }
-        
+        label { display: block; font-weight: 600; color: #333; margin-bottom: 8px; }
         input[type="text"] {
             width: 100%;
             padding: 12px 16px;
             border: 2px solid #e0e0e0;
             border-radius: 8px;
             font-size: 16px;
+            margin-bottom: 20px;
         }
         input[type="text"]:focus { outline: none; border-color: #667eea; }
         
@@ -234,7 +417,6 @@ HTML_PAGE = """
             font-weight: 600;
             cursor: pointer;
             transition: transform 0.2s;
-            margin-top: 20px;
         }
         .btn:hover { transform: translateY(-2px); }
         .btn:disabled { background: #ccc; cursor: not-allowed; transform: none; }
@@ -242,29 +424,45 @@ HTML_PAGE = """
         .msg {
             padding: 15px;
             border-radius: 8px;
-            margin-top: 20px;
+            margin-bottom: 20px;
             text-align: center;
         }
         .msg.info { background: #e3f2fd; color: #1565c0; }
         .msg.success { background: #e8f5e9; color: #2e7d32; }
         .msg.error { background: #ffebee; color: #c62828; }
         
+        .screenshot-container {
+            margin: 20px 0;
+            text-align: center;
+            display: none;
+        }
+        .screenshot-container img {
+            max-width: 100%;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            border: 1px solid #e0e0e0;
+        }
+        .screenshot-tip {
+            color: #666;
+            margin-bottom: 10px;
+            font-size: 14px;
+        }
+        
         .spinner {
             border: 3px solid #f3f3f3;
             border-top: 3px solid #667eea;
             border-radius: 50%;
-            width: 30px;
-            height: 30px;
+            width: 40px;
+            height: 40px;
             animation: spin 1s linear infinite;
-            margin: 10px auto;
+            margin: 20px auto;
         }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         
-        .tip {
-            color: #888;
-            font-size: 12px;
-            margin-top: 5px;
-        }
+        .progress { display: none; text-align: center; padding: 20px; }
+        .status-text { color: #666; margin-top: 10px; }
+        
+        .timer { color: #999; font-size: 12px; margin-top: 5px; }
     </style>
 </head>
 <body>
@@ -274,106 +472,118 @@ HTML_PAGE = """
         
         <div id="msg" class="msg info" style="display:none;"></div>
         
-        <!-- 步骤1 -->
-        <div class="step">
-            <div class="step-title">
-                <span class="step-num">1</span>
-                打开WPS表格
-            </div>
-            <div class="link-box">
-                <a href="WPS_URL" target="_blank" id="wps_link">WPS_URL</a>
-            </div>
-            <p style="color:#666;font-size:13px;">点击上方链接，如需登录请扫码</p>
-        </div>
-        
-        <!-- 步骤2 -->
-        <div class="step">
-            <div class="step-title">
-                <span class="step-num">2</span>
-                复制表格内容
-            </div>
-            <p style="color:#666;font-size:13px;margin-bottom:10px;">
-                在WPS中：选择最新Sheet → Ctrl+A 全选 → Ctrl+C 复制
-            </p>
-        </div>
-        
-        <!-- 步骤3 -->
-        <div class="step">
-            <div class="step-title">
-                <span class="step-num">3</span>
-                粘贴并生成
-            </div>
+        <form id="form">
+            <label>WPS表格地址</label>
+            <input type="text" id="wps_url" value="WPS_URL" placeholder="WPS在线表格地址">
             
-            <label>粘贴表格内容</label>
-            <textarea id="content" placeholder="在此粘贴从WPS复制的内容（Ctrl+V）..."></textarea>
-            <p class="tip">直接 Ctrl+V 粘贴即可</p>
+            <label>日期范围（选填，如：0303-0307）</label>
+            <input type="text" id="date" placeholder="留空自动从Sheet名称识别">
             
-            <label>日期范围</label>
-            <input type="text" id="date" placeholder="如：0303-0307（留空自动识别）">
-            
-            <button type="button" class="btn" id="btn" onclick="generate()">生成周报</button>
-        </div>
+            <button type="submit" class="btn" id="btn">生成周报</button>
+        </form>
         
-        <div id="loading" style="display:none;text-align:center;padding:20px;">
+        <div class="progress" id="progress">
             <div class="spinner"></div>
-            <p>正在生成周报...</p>
+            <div id="status" class="status-text">正在处理...</div>
+            <div id="timer" class="timer"></div>
+        </div>
+        
+        <div class="screenshot-container" id="screenshot-container">
+            <p class="screenshot-tip">📱 请扫描下方二维码登录微信</p>
+            <img id="screenshot" src="" alt="登录二维码">
+            <p class="timer" id="wait_tip">等待扫码中...</p>
         </div>
     </div>
     
     <script>
-        function generate() {
-            const content = document.getElementById('content').value.trim();
+        let pollInterval;
+        let startTime;
+        
+        document.getElementById('form').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const wpsUrl = document.getElementById('wps_url').value.trim();
             const date = document.getElementById('date').value.trim();
             const msgDiv = document.getElementById('msg');
-            const loadingDiv = document.getElementById('loading');
+            const progressDiv = document.getElementById('progress');
+            const statusDiv = document.getElementById('status');
+            const timerDiv = document.getElementById('timer');
+            const screenshotContainer = document.getElementById('screenshot-container');
+            const screenshotImg = document.getElementById('screenshot');
+            const waitTip = document.getElementById('wait_tip');
             const btn = document.getElementById('btn');
             
-            if (!content) {
-                msgDiv.className = 'msg error';
-                msgDiv.textContent = '请先粘贴表格内容';
-                msgDiv.style.display = 'block';
-                return;
-            }
-            
             btn.disabled = true;
-            loadingDiv.style.display = 'block';
             msgDiv.style.display = 'none';
+            progressDiv.style.display = 'block';
+            screenshotContainer.style.display = 'none';
+            startTime = Date.now();
             
-            fetch('/api/generate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ content: content, date: date })
-            })
-            .then(response => {
-                if (!response.ok) {
-                    return response.json().then(data => { throw new Error(data.error || '生成失败'); });
-                }
-                return response.blob();
-            })
-            .then(blob => {
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = '周报(' + (date || '未知日期') + ').docx';
-                document.body.appendChild(a);
-                a.click();
-                window.URL.revokeObjectURL(url);
-                document.body.removeChild(a);
+            try {
+                // 开始生成
+                statusDiv.textContent = '正在启动浏览器...';
+                const startRes = await fetch('/api/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ wps_url: wpsUrl, date: date })
+                });
+                const startData = await startRes.json();
+                const taskId = startData.task_id;
                 
-                msgDiv.className = 'msg success';
-                msgDiv.textContent = '周报已生成并下载！';
-                msgDiv.style.display = 'block';
-            })
-            .catch(err => {
+                // 轮询状态
+                let done = false;
+                while (!done) {
+                    await new Promise(r => setTimeout(r, 1500));
+                    
+                    const checkRes = await fetch('/api/status/' + taskId);
+                    const data = await checkRes.json();
+                    
+                    // 更新状态
+                    statusDiv.textContent = data.message || '处理中...';
+                    
+                    // 计时器
+                    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                    timerDiv.textContent = '已用时: ' + elapsed + ' 秒';
+                    
+                    if (data.status === 'waiting_login') {
+                        // 显示二维码
+                        progressDiv.style.display = 'none';
+                        screenshotContainer.style.display = 'block';
+                        
+                        if (data.screenshot) {
+                            screenshotImg.src = 'data:image/jpeg;base64,' + data.screenshot;
+                        }
+                        if (data.wait_time) {
+                            waitTip.textContent = '等待扫码中... ' + data.wait_time + ' 秒';
+                        }
+                        
+                    } else if (data.status === 'done') {
+                        done = true;
+                        screenshotContainer.style.display = 'none';
+                        progressDiv.style.display = 'none';
+                        
+                        // 下载文档
+                        window.location.href = '/api/download/' + taskId;
+                        
+                        msgDiv.className = 'msg success';
+                        msgDiv.textContent = '周报已生成，正在下载...';
+                        msgDiv.style.display = 'block';
+                        
+                    } else if (data.status === 'error') {
+                        throw new Error(data.message);
+                    }
+                }
+                
+            } catch (err) {
                 msgDiv.className = 'msg error';
                 msgDiv.textContent = '错误: ' + err.message;
                 msgDiv.style.display = 'block';
-            })
-            .finally(() => {
+                progressDiv.style.display = 'none';
+                screenshotContainer.style.display = 'none';
+            } finally {
                 btn.disabled = false;
-                loadingDiv.style.display = 'none';
-            });
-        }
+            }
+        });
     </script>
 </body>
 </html>
@@ -385,37 +595,50 @@ async def index():
     return HTML_PAGE
 
 
-class GenerateRequest(BaseModel):
-    content: str
+class StartRequest(BaseModel):
+    wps_url: str = DEFAULT_WPS_URL
     date: str = ""
 
 
-@app.post("/api/generate")
-async def generate(req: GenerateRequest):
-    """生成周报"""
-    try:
-        if not req.content:
-            return JSONResponse({"error": "表格内容为空"}, status_code=400)
-        
-        # 如果没有日期，尝试从内容中提取
-        date = req.date
-        if not date:
-            # 尝试匹配日期格式
-            match = re.search(r'(\d{4}[-—]\d{4})', req.content)
-            if match:
-                date = match.group(1)
-            else:
-                date = datetime.now().strftime("%m%d") + "-" + (datetime.now() + timedelta(days=4)).strftime("%m%d")
-        
-        doc_bytes = generate_report(req.content, date)
+@app.post("/api/start")
+async def start_task(req: StartRequest):
+    """开始任务"""
+    task_id = datetime.now().strftime("%Y%m%d%H%M%S") + str(id(req))
+    tasks[task_id] = {
+        "status": "starting",
+        "message": "正在初始化..."
+    }
+    
+    # 启动后台任务
+    asyncio.create_task(run_browser_task(task_id, req.wps_url, req.date))
+    
+    return {"task_id": task_id}
+
+
+@app.get("/api/status/{task_id}")
+async def get_status(task_id: str):
+    """获取任务状态"""
+    task = tasks.get(task_id, {"status": "unknown", "message": "任务不存在"})
+    # 不返回 document 字段（太大）
+    result = {k: v for k, v in task.items() if k != "document"}
+    return result
+
+
+@app.get("/api/download/{task_id}")
+async def download(task_id: str):
+    """下载文档"""
+    task = tasks.get(task_id, {})
+    if task.get("document"):
+        doc_b64 = task["document"]
+        doc_bytes = base64.b64decode(doc_b64)
+        date = task.get("date", "unknown")
         
         return Response(
             content=doc_bytes,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"Content-Disposition": f'attachment; filename="周报({date}).docx"'}
         )
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse({"error": "文档不存在"}, status_code=404)
 
 
 if __name__ == "__main__":
