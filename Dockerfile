@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
 WORKDIR /app
 
@@ -6,12 +6,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
+# 安装浏览器（Chromium）
+RUN playwright install chromium
+
 # 复制代码和模板
-COPY web_app.py .
+COPY web_app_cloud.py .
 COPY template.docx .
 
 # 暴露端口
 EXPOSE 8000
 
 # 启动命令
-CMD ["uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "web_app_cloud:app", "--host", "0.0.0.0", "--port", "8000"]
