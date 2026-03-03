@@ -1,6 +1,6 @@
 """
-周报助手 - 云端全自动版
-用户只需扫码登录，其他全自动
+周报助手 - 云端版
+服务器浏览器持久化登录
 """
 
 import asyncio
@@ -9,6 +9,7 @@ import sys
 import csv
 import re
 import base64
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 from io import StringIO
@@ -27,11 +28,19 @@ from docx.oxml import OxmlElement
 # 配置
 TEMPLATE = Path("template.docx")
 DEFAULT_WPS_URL = "https://www.kdocs.cn/l/cmvjNWclJM5P"
+# 持久化登录数据目录
+AUTH_DIR = Path("/tmp/wps_auth")
+AUTH_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="周报助手")
 
 # 任务存储
 tasks = {}
+
+# 全局浏览器实例（保持登录状态）
+_browser_context = None
+_browser = None
+_playwright = None
 
 
 def parse_table(text):
@@ -46,6 +55,8 @@ def parse_table(text):
 def set_font(cell, font='仿宋', size=11, bold=False):
     """设置字体"""
     for p in cell.paragraphs:
+        if len(p.runs) == 0:
+            continue
         for r in p.runs:
             r.font.name = font
             r._element.rPr.rFonts.set(qn('w:eastAsia'), font)
@@ -85,13 +96,20 @@ def generate_report(table_content: str, date: str) -> bytes:
     for para in doc.paragraphs:
         full_text = ''.join([r.text for r in para.runs])
         if '工作周报' in full_text:
+            # 清空所有run
             for run in para.runs:
                 run.text = ''
-            para.runs[0].text = f'工作周报（{date}）'
-            para.runs[0].font.name = '微软雅黑'
-            para.runs[0]._element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
-            para.runs[0].font.size = Pt(20)
-            para.runs[0].font.bold = True
+            # 如果没有run，添加一个
+            if len(para.runs) == 0:
+                run = para.add_run(f'工作周报（{date}）')
+            else:
+                para.runs[0].text = f'工作周报（{date}）'
+                run = para.runs[0]
+            # 设置字体
+            run.font.name = '微软雅黑'
+            run._element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+            run.font.size = Pt(20)
+            run.font.bold = True
             break
     
     # 找详细工单位置
@@ -108,8 +126,9 @@ def generate_report(table_content: str, date: str) -> bytes:
     add_borders(t1)
     for i, row in enumerate(data):
         for j, txt in enumerate(row):
-            t1.rows[i].cells[j].text = txt
-            set_font(t1.rows[i].cells[j], bold=(i==0))
+            if j < len(t1.rows[i].cells):
+                t1.rows[i].cells[j].text = txt
+                set_font(t1.rows[i].cells[j], bold=(i==0))
     
     if detail:
         detail._element.addprevious(t1._tbl)
@@ -120,8 +139,9 @@ def generate_report(table_content: str, date: str) -> bytes:
     add_borders(t2)
     for i, row in enumerate(data2):
         for j, txt in enumerate(row):
-            t2.rows[i].cells[j].text = txt
-            set_font(t2.rows[i].cells[j], bold=(i==0))
+            if j < len(t2.rows[i].cells):
+                t2.rows[i].cells[j].text = txt
+                set_font(t2.rows[i].cells[j], bold=(i==0))
     
     if detail:
         detail._element.addnext(t2._tbl)
@@ -133,99 +153,100 @@ def generate_report(table_content: str, date: str) -> bytes:
     return buffer.getvalue()
 
 
-async def run_browser_task(task_id: str, wps_url: str, input_date: str):
-    """后台运行浏览器任务"""
-    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+async def get_browser_context():
+    """获取或创建浏览器上下文（持久化登录）"""
+    global _browser_context, _browser, _playwright
     
-    browser = None
-    playwright = None
-    
-    try:
-        tasks[task_id]["status"] = "launching"
-        tasks[task_id]["message"] = "正在启动浏览器..."
+    if _browser_context is None:
+        from playwright.async_api import async_playwright
         
-        playwright = await async_playwright().start()
-        
-        # 启动浏览器（无头模式，但添加隐藏自动化特征的参数）
-        browser = await playwright.chromium.launch(
+        _playwright = await async_playwright().start()
+        _browser = await _playwright.chromium.launch(
             headless=True,
             args=[
                 '--disable-blink-features=AutomationControlled',
-                '--disable-infobars',
                 '--no-sandbox',
                 '--disable-dev-shm-usage',
             ]
         )
         
-        context = await browser.new_context(
+        # 使用持久化上下文
+        _browser_context = await _browser.new_context(
             viewport={'width': 1280, 'height': 800},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            storage_state=str(AUTH_DIR / "state.json") if (AUTH_DIR / "state.json").exists() else None
         )
+        
+        # 保存状态
+        await _browser_context.storage_state(path=str(AUTH_DIR / "state.json"))
+    
+    return _browser_context
+
+
+async def run_browser_task(task_id: str, wps_url: str, input_date: str):
+    """后台运行浏览器任务"""
+    page = None
+    
+    try:
+        context = await get_browser_context()
         page = await context.new_page()
         
-        # 注入脚本隐藏自动化特征
+        # 隐藏自动化特征
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = {runtime: {}};
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh']});
         """)
         
-        # 打开WPS
         tasks[task_id]["status"] = "loading"
         tasks[task_id]["message"] = "正在打开WPS表格..."
         
         try:
             await page.goto(wps_url, wait_until="domcontentloaded", timeout=30000)
-        except:
-            pass
+        except Exception as e:
+            tasks[task_id]["message"] = f"页面加载中... ({str(e)[:30]})"
         
         await asyncio.sleep(3)
         
-        # 检测是否需要登录
-        tasks[task_id]["status"] = "waiting_login"
-        tasks[task_id]["message"] = "请在下方扫码登录微信"
+        # 检查是否需要登录
+        current_url = page.url
+        print(f"[DEBUG] Current URL: {current_url}")
         
-        # 等待登录，每2秒截图一次
-        max_wait = 90  # 最多等待90秒
-        logged_in = False
-        
-        for i in range(max_wait // 2):
-            try:
-                # 截图
-                screenshot = await page.screenshot(type="jpeg", quality=60)
-                screenshot_b64 = base64.b64encode(screenshot).decode('utf-8')
-                tasks[task_id]["screenshot"] = screenshot_b64
-                tasks[task_id]["wait_time"] = i * 2
+        if 'passport' in current_url or 'singlesign' in current_url or 'login' in current_url or 'sso' in current_url:
+            tasks[task_id]["status"] = "waiting_login"
+            tasks[task_id]["message"] = "需要登录，请扫码..."
+            
+            # 截取登录页面
+            for i in range(30):
+                try:
+                    screenshot = await page.screenshot(type="jpeg", quality=50)
+                    screenshot_b64 = base64.b64encode(screenshot).decode('utf-8')
+                    tasks[task_id]["screenshot"] = screenshot_b64
+                except:
+                    pass
                 
-                # 检查URL
+                # 检查是否登录成功
                 current_url = page.url
                 if 'passport' not in current_url and 'singlesign' not in current_url and 'login' not in current_url:
-                    # 检查是否有表格元素
+                    # 保存登录状态
                     try:
-                        canvas = await page.query_selector('[class*="canvas"], [class*="sheet"], [class*="editor"], canvas')
-                        if canvas:
-                            logged_in = True
-                            break
+                        await context.storage_state(path=str(AUTH_DIR / "state.json"))
                     except:
                         pass
+                    break
                 
                 await asyncio.sleep(2)
-            except Exception as e:
-                await asyncio.sleep(2)
-        
-        if not logged_in:
-            # 最后再检查一次
+            
+            # 再检查一次
             current_url = page.url
-            if 'passport' not in current_url and 'singlesign' not in current_url:
-                logged_in = True
+            if 'passport' in current_url or 'singlesign' in current_url or 'login' in current_url:
+                if page:
+                    try:
+                        await page.close()
+                    except:
+                        pass
+                raise Exception("请在显示的页面中扫码登录，登录后请刷新页面重新生成")
         
-        if not logged_in:
-            raise Exception("登录超时，请刷新页面重试")
-        
-        # 登录成功
         tasks[task_id]["status"] = "reading"
-        tasks[task_id]["message"] = "登录成功，正在读取表格..."
+        tasks[task_id]["message"] = "正在读取表格数据..."
         tasks[task_id]["screenshot"] = None
         
         # 等待表格加载
@@ -234,99 +255,84 @@ async def run_browser_task(task_id: str, wps_url: str, input_date: str):
         # 点击最新Sheet
         sheet_name = ""
         try:
-            # 尝试多种选择器
-            selectors = [
-                '[class*="sheet-tab"]:not([style*="display: none"])',
-                '.sheet-tab:last-child',
-                '[role="tab"]:last-child',
-            ]
-            for selector in selectors:
-                try:
-                    tabs = await page.query_selector_all(selector)
-                    if tabs:
-                        last_tab = tabs[-1]
-                        sheet_name = await last_tab.inner_text()
-                        sheet_name = sheet_name.strip()
-                        await last_tab.click()
-                        await asyncio.sleep(2)
-                        break
-                except:
-                    continue
+            tabs = await page.query_selector_all('[class*="sheet-tab"], .sheet-tab, [role="tab"]')
+            if tabs:
+                last_tab = tabs[-1]
+                sheet_name = await last_tab.inner_text()
+                sheet_name = sheet_name.strip()
+                await last_tab.click()
+                await asyncio.sleep(2)
         except Exception as e:
-            pass
+            print(f"[DEBUG] Sheet selection error: {e}")
         
-        # 获取表格数据
-        tasks[task_id]["message"] = "正在提取表格数据..."
+        tasks[task_id]["message"] = "正在提取表格内容..."
         
-        # 方法1：使用JavaScript提取表格
-        table_text = await page.evaluate('''() => {
-            // 尝试从剪贴板API获取
-            // 或者遍历DOM获取表格内容
-            
-            let result = [];
-            
-            // 查找所有单元格
-            const cells = document.querySelectorAll('td, th, [class*="cell"]');
-            if (cells.length > 0) {
-                let rows = {};
-                cells.forEach(cell => {
-                    const rect = cell.getBoundingClientRect();
-                    const y = Math.round(rect.top / 25); // 按行分组
-                    if (!rows[y]) rows[y] = [];
-                    rows[y].push(cell.innerText?.trim() || '');
-                });
-                
-                const sortedYs = Object.keys(rows).sort((a, b) => a - b);
-                sortedYs.forEach(y => {
-                    result.push(rows[y].join('\\t'));
-                });
-                
-                return result.join('\\n');
-            }
-            
-            // 备选：获取整个编辑区内容
-            const editor = document.querySelector('[class*="editor"], [class*="canvas"], [contenteditable="true"]');
-            if (editor) {
-                return editor.innerText;
-            }
-            
-            return '';
-        }''')
+        # 提取表格数据 - 多种方式尝试
+        table_text = ""
         
-        # 方法2：如果方法1失败，尝试全选复制
-        if not table_text or len(table_text) < 20:
-            try:
-                # 点击编辑区域
-                await page.click('[class*="canvas"], [class*="editor"], body', timeout=3000)
-            except:
-                pass
-            await asyncio.sleep(0.5)
-            
-            # 全选
-            await page.keyboard.press('Control+A')
-            await asyncio.sleep(0.5)
-            
-            # 复制
-            await page.keyboard.press('Control+C')
-            await asyncio.sleep(1)
-            
-            # 使用JavaScript读取选中内容
+        # 方法1：JavaScript提取
+        try:
             table_text = await page.evaluate('''() => {
-                const selection = window.getSelection();
-                if (selection.rangeCount > 0) {
-                    const range = selection.getRangeAt(0);
-                    const div = document.createElement('div');
-                    div.appendChild(range.cloneContents());
-                    return div.innerText || '';
+                const editor = document.querySelector('[class*="editor"], [class*="canvas"], [contenteditable="true"]');
+                if (editor) {
+                    document.execCommand('selectAll', false, null);
+                    const sel = window.getSelection();
+                    if (sel.rangeCount > 0) {
+                        const div = document.createElement('div');
+                        div.appendChild(sel.getRangeAt(0).cloneContents());
+                        return div.innerText;
+                    }
+                }
+                
+                const cells = document.querySelectorAll('td, th, [class*="cell"]');
+                if (cells.length > 0) {
+                    let rows = {};
+                    cells.forEach(cell => {
+                        const rect = cell.getBoundingClientRect();
+                        const y = Math.round(rect.top / 30);
+                        if (!rows[y]) rows[y] = [];
+                        rows[y].push(cell.innerText?.trim() || '');
+                    });
+                    return Object.keys(rows).sort((a,b) => a-b).map(y => rows[y].join('\\t')).join('\\n');
                 }
                 return '';
             }''')
+        except Exception as e:
+            print(f"[DEBUG] JS extract error: {e}")
         
-        # 关闭浏览器
-        await browser.close()
-        await playwright.stop()
-        browser = None
-        playwright = None
+        # 方法2：键盘全选复制
+        if not table_text or len(table_text) < 20:
+            try:
+                await page.click('body', timeout=2000)
+            except:
+                pass
+            await asyncio.sleep(0.3)
+            await page.keyboard.press('Control+A')
+            await asyncio.sleep(0.5)
+            await page.keyboard.press('Control+C')
+            await asyncio.sleep(1)
+            
+            try:
+                table_text = await page.evaluate('''() => {
+                    const sel = window.getSelection();
+                    if (sel.rangeCount > 0) {
+                        const div = document.createElement('div');
+                        div.appendChild(sel.getRangeAt(0).cloneContents());
+                        return div.innerText;
+                    }
+                    return '';
+                }''')
+            except:
+                pass
+        
+        print(f"[DEBUG] Table text length: {len(table_text) if table_text else 0}")
+        
+        # 关闭页面（保持上下文）
+        if page:
+            try:
+                await page.close()
+            except:
+                pass
         
         # 确定日期
         date = input_date
@@ -334,15 +340,16 @@ async def run_browser_task(task_id: str, wps_url: str, input_date: str):
             match = re.search(r'(\d{4}[-—–]\d{4})', sheet_name)
             if match:
                 date = match.group(1).replace('—', '-').replace('–', '-')
+            elif sheet_name:
+                date = sheet_name
             else:
                 date = datetime.now().strftime("%m%d") + "-" + (datetime.now() + timedelta(days=4)).strftime("%m%d")
         
         tasks[task_id]["date"] = date
         tasks[task_id]["message"] = "正在生成周报..."
         
-        # 生成报告
         if not table_text or len(table_text) < 10:
-            raise ValueError("未能读取表格内容，请确保已登录并选择了正确的Sheet")
+            raise ValueError("未能读取表格内容，请确保WPS表格已正确加载")
         
         doc_bytes = generate_report(table_text, date)
         tasks[task_id]["document"] = base64.b64encode(doc_bytes).decode('utf-8')
@@ -352,15 +359,9 @@ async def run_browser_task(task_id: str, wps_url: str, input_date: str):
     except Exception as e:
         tasks[task_id]["status"] = "error"
         tasks[task_id]["message"] = f"错误: {str(e)}"
-    finally:
-        if browser:
+        if page:
             try:
-                await browser.close()
-            except:
-                pass
-        if playwright:
-            try:
-                await playwright.stop()
+                await page.close()
             except:
                 pass
 
@@ -389,7 +390,7 @@ HTML_PAGE = """
             border-radius: 16px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             padding: 40px;
-            max-width: 800px;
+            max-width: 700px;
             width: 100%;
         }
         h1 { color: #333; margin-bottom: 10px; font-size: 28px; text-align: center; }
@@ -440,12 +441,11 @@ HTML_PAGE = """
             max-width: 100%;
             border-radius: 8px;
             box-shadow: 0 4px 20px rgba(0,0,0,0.2);
-            border: 1px solid #e0e0e0;
         }
         .screenshot-tip {
-            color: #666;
+            color: #e65100;
+            font-weight: 600;
             margin-bottom: 10px;
-            font-size: 14px;
         }
         
         .spinner {
@@ -462,7 +462,14 @@ HTML_PAGE = """
         .progress { display: none; text-align: center; padding: 20px; }
         .status-text { color: #666; margin-top: 10px; }
         
-        .timer { color: #999; font-size: 12px; margin-top: 5px; }
+        .tip {
+            background: #fff3e0;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            color: #e65100;
+        }
     </style>
 </head>
 <body>
@@ -472,12 +479,16 @@ HTML_PAGE = """
         
         <div id="msg" class="msg info" style="display:none;"></div>
         
+        <div class="tip">
+            提示：首次使用需要扫码登录WPS，登录状态会自动保存，后续使用无需重复登录。
+        </div>
+        
         <form id="form">
             <label>WPS表格地址</label>
-            <input type="text" id="wps_url" value="WPS_URL" placeholder="WPS在线表格地址">
+            <input type="text" id="wps_url" value="WPS_URL">
             
-            <label>日期范围（选填，如：0303-0307）</label>
-            <input type="text" id="date" placeholder="留空自动从Sheet名称识别">
+            <label>日期范围（选填）</label>
+            <input type="text" id="date" placeholder="如：0303-0307（留空自动识别）">
             
             <button type="submit" class="btn" id="btn">生成周报</button>
         </form>
@@ -485,20 +496,17 @@ HTML_PAGE = """
         <div class="progress" id="progress">
             <div class="spinner"></div>
             <div id="status" class="status-text">正在处理...</div>
-            <div id="timer" class="timer"></div>
         </div>
         
         <div class="screenshot-container" id="screenshot-container">
-            <p class="screenshot-tip">📱 请扫描下方二维码登录微信</p>
-            <img id="screenshot" src="" alt="登录二维码">
-            <p class="timer" id="wait_tip">等待扫码中...</p>
+            <p class="screenshot-tip">请在下方页面中扫码登录微信</p>
+            <img id="screenshot" src="" alt="登录页面">
+            <p style="color:#666;margin-top:10px;font-size:13px;">扫码登录后，请点击下方按钮重新生成</p>
+            <button type="button" class="btn" style="margin-top:15px;background:#4caf50;" onclick="location.reload()">我已扫码登录，重新生成</button>
         </div>
     </div>
     
     <script>
-        let pollInterval;
-        let startTime;
-        
         document.getElementById('form').addEventListener('submit', async function(e) {
             e.preventDefault();
             
@@ -507,21 +515,17 @@ HTML_PAGE = """
             const msgDiv = document.getElementById('msg');
             const progressDiv = document.getElementById('progress');
             const statusDiv = document.getElementById('status');
-            const timerDiv = document.getElementById('timer');
             const screenshotContainer = document.getElementById('screenshot-container');
             const screenshotImg = document.getElementById('screenshot');
-            const waitTip = document.getElementById('wait_tip');
             const btn = document.getElementById('btn');
             
             btn.disabled = true;
             msgDiv.style.display = 'none';
             progressDiv.style.display = 'block';
             screenshotContainer.style.display = 'none';
-            startTime = Date.now();
             
             try {
-                // 开始生成
-                statusDiv.textContent = '正在启动浏览器...';
+                statusDiv.textContent = '正在启动...';
                 const startRes = await fetch('/api/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -530,39 +534,29 @@ HTML_PAGE = """
                 const startData = await startRes.json();
                 const taskId = startData.task_id;
                 
-                // 轮询状态
                 let done = false;
                 while (!done) {
-                    await new Promise(r => setTimeout(r, 1500));
+                    await new Promise(r => setTimeout(r, 2000));
                     
                     const checkRes = await fetch('/api/status/' + taskId);
                     const data = await checkRes.json();
                     
-                    // 更新状态
                     statusDiv.textContent = data.message || '处理中...';
                     
-                    // 计时器
-                    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                    timerDiv.textContent = '已用时: ' + elapsed + ' 秒';
-                    
                     if (data.status === 'waiting_login') {
-                        // 显示二维码
                         progressDiv.style.display = 'none';
                         screenshotContainer.style.display = 'block';
                         
                         if (data.screenshot) {
                             screenshotImg.src = 'data:image/jpeg;base64,' + data.screenshot;
                         }
-                        if (data.wait_time) {
-                            waitTip.textContent = '等待扫码中... ' + data.wait_time + ' 秒';
-                        }
+                        return;
                         
                     } else if (data.status === 'done') {
                         done = true;
-                        screenshotContainer.style.display = 'none';
                         progressDiv.style.display = 'none';
+                        screenshotContainer.style.display = 'none';
                         
-                        // 下载文档
                         window.location.href = '/api/download/' + taskId;
                         
                         msgDiv.className = 'msg success';
@@ -609,7 +603,6 @@ async def start_task(req: StartRequest):
         "message": "正在初始化..."
     }
     
-    # 启动后台任务
     asyncio.create_task(run_browser_task(task_id, req.wps_url, req.date))
     
     return {"task_id": task_id}
@@ -619,7 +612,6 @@ async def start_task(req: StartRequest):
 async def get_status(task_id: str):
     """获取任务状态"""
     task = tasks.get(task_id, {"status": "unknown", "message": "任务不存在"})
-    # 不返回 document 字段（太大）
     result = {k: v for k, v in task.items() if k != "document"}
     return result
 
